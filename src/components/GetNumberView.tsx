@@ -184,9 +184,9 @@ export const GetNumberView: React.FC<GetNumberViewProps> = ({
     };
   }, []);
 
-  // Poll for incoming OTP while activeOrder is WAITING
+  // Poll for incoming OTP while activeOrder is WAITING and belongs to this user
   useEffect(() => {
-    if (!activeOrder || activeOrder.status !== 'WAITING') {
+    if (!activeOrder || activeOrder.status !== 'WAITING' || (userProfile && activeOrder.userId !== userProfile.id)) {
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       return;
     }
@@ -388,8 +388,8 @@ export const GetNumberView: React.FC<GetNumberViewProps> = ({
 
   return (
     <div ref={topRef} className="space-y-4 sm:space-y-6">
-      {/* 1. TOP SECTION: ACTIVE NUMBER & LIVE OTP CARD (PERSISTS ON REFRESH!) */}
-      {activeOrder && (
+      {/* 1. TOP SECTION: ACTIVE NUMBER & LIVE OTP CARD (PERSISTS ON REFRESH FOR LOGGED IN OWNER ONLY) */}
+      {activeOrder && (!userProfile || activeOrder.userId === userProfile.id) && (
         <div className="relative overflow-hidden rounded-2xl border-2 border-emerald-500/50 bg-gradient-to-b from-slate-900/95 to-slate-950/95 p-4 sm:p-6 shadow-2xl shadow-emerald-950/60 backdrop-blur-md animate-in fade-in">
           {/* Card Top Meta Row */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3 sm:pb-4">
