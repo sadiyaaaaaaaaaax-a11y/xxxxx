@@ -21,6 +21,51 @@ import { collection, query, orderBy, onSnapshot, doc, updateDoc, setDoc } from '
 import { PhoneCall, History, Radio, Terminal, User } from 'lucide-react';
 import { detectCountryFromRange, normalizeServiceName } from './lib/countryUtils';
 
+// User-scoped LocalStorage helpers to prevent cross-user leakage
+const getUserOrdersKey = (uid: string) => `nxv_sms_orders_${uid}`;
+const getUserActiveOrderKey = (uid: string) => `nxv_active_order_${uid}`;
+
+const getStoredUserOrders = (uid: string): SmsOrder[] => {
+  try {
+    const saved = localStorage.getItem(getUserOrdersKey(uid));
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((o) => o && o.userId === uid);
+      }
+    }
+  } catch {}
+  return [];
+};
+
+const setStoredUserOrders = (uid: string, list: SmsOrder[]) => {
+  try {
+    const filtered = list.filter((o) => o && o.userId === uid);
+    localStorage.setItem(getUserOrdersKey(uid), JSON.stringify(filtered));
+  } catch {}
+};
+
+const getStoredUserActiveOrder = (uid: string): SmsOrder | null => {
+  try {
+    const saved = localStorage.getItem(getUserActiveOrderKey(uid));
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && parsed.userId === uid) return parsed;
+    }
+  } catch {}
+  return null;
+};
+
+const setStoredUserActiveOrder = (uid: string, order: SmsOrder | null) => {
+  try {
+    if (order && order.userId === uid) {
+      localStorage.setItem(getUserActiveOrderKey(uid), JSON.stringify(order));
+    } else {
+      localStorage.removeItem(getUserActiveOrderKey(uid));
+    }
+  } catch {}
+};
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>('getnum');
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false);
@@ -35,31 +80,32 @@ export default function App() {
     }
   });
 
-  // Persistent Orders State: Load immediately from localStorage so refresh never clears history
+  // User-isolated Orders State: Load ONLY this logged-in user's stored orders
   const [orders, setOrders] = useState<SmsOrder[]>(() => {
     try {
-      const saved = localStorage.getItem('nxv_sms_orders');
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
+      const savedUser = localStorage.getItem('nxv_user_profile');
+      if (savedUser) {
+        const u = JSON.parse(savedUser);
+        if (u && u.id) {
+          return getStoredUserOrders(u.id);
+        }
+      }
+    } catch {}
+    return [];
   });
 
-  // Persistent Active Order State: Load immediately from localStorage so active number never vanishes
+  // User-isolated Active Order State: Load ONLY this logged-in user's active order
   const [activeOrder, setActiveOrder] = useState<SmsOrder | null>(() => {
     try {
-      const savedActive = localStorage.getItem('nxv_active_order');
-      if (savedActive) return JSON.parse(savedActive);
-
-      const savedOrders = localStorage.getItem('nxv_sms_orders');
-      if (savedOrders) {
-        const list = JSON.parse(savedOrders) as SmsOrder[];
-        if (list.length > 0) return list[0];
+      const savedUser = localStorage.getItem('nxv_user_profile');
+      if (savedUser) {
+        const u = JSON.parse(savedUser);
+        if (u && u.id) {
+          return getStoredUserActiveOrder(u.id);
+        }
       }
-      return null;
-    } catch {
-      return null;
-    }
+    } catch {}
+    return null;
   });
 
   // Active Ranges
@@ -105,33 +151,51 @@ export default function App() {
     }
   }, [userProfile]);
 
-  // Sync orders to localStorage on any state change
+  // Sync orders strictly to current user's scoped storage
+  useEffect(() => {
+    if (userProfile?.id) {
+      setStoredUserOrders(userProfile.id, orders);
+    }
+  }, [orders, userProfile?.id]);
+
+  // Sync activeOrder strictly to current user's scoped storage
+  useEffect(() => {
+    if (userProfile?.id) {
+      setStoredUserActiveOrder(userProfile.id, activeOrder);
+    }
+  }, [activeOrder, userProfile?.id]);
+
+  // 1. Initial connection & data load + cleanup legacy non-scoped storage
   useEffect(() => {
     try {
-      localStorage.setItem('nxv_sms_orders', JSON.stringify(orders));
+      localStorage.removeItem('nxv_sms_orders');
+      localStorage.removeItem('nxv_active_order');
     } catch {}
-  }, [orders]);
 
-  // Sync activeOrder to localStorage on any state change
-  useEffect(() => {
-    if (activeOrder) {
-      try {
-        localStorage.setItem('nxv_active_order', JSON.stringify(activeOrder));
-      } catch {}
-    }
-  }, [activeOrder]);
-
-  // 1. Initial connection & data load
-  useEffect(() => {
     testConnection().catch(() => {});
     loadActiveRanges();
     loadBroadcasts();
   }, []);
 
-  // 2. Firebase Auth Listener & Firestore Real-time Orders Sync
+  // 2. Firebase Auth Listener & STRICT User Isolation for Firestore Orders
   useEffect(() => {
+    let unsubOrders: (() => void) | null = null;
+
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (unsubOrders) {
+        unsubOrders();
+        unsubOrders = null;
+      }
+
       if (firebaseUser) {
+        const uid = firebaseUser.uid;
+
+        // Immediately load this specific user's cached numbers
+        const userSavedOrders = getStoredUserOrders(uid);
+        const userSavedActive = getStoredUserActiveOrder(uid);
+        setOrders(userSavedOrders);
+        setActiveOrder(userSavedActive);
+
         try {
           const profile = await fetchOrCreateUserProfile(firebaseUser);
           setUserProfile(profile);
@@ -139,35 +203,9 @@ export default function App() {
             type: 'success',
             message: `User signed in: ${profile.displayName} (${profile.email})`,
           });
-
-          // Sync user orders from Firestore & merge with local storage
-          const ordersRef = collection(db, 'users', firebaseUser.uid, 'smsOrders');
-          const q = query(ordersRef, orderBy('createdAt', 'desc'));
-          const unsubOrders = onSnapshot(
-            q,
-            (snapshot) => {
-              const fsItems: SmsOrder[] = [];
-              snapshot.forEach((d) => fsItems.push(d.data() as SmsOrder));
-              if (fsItems.length > 0) {
-                setOrders((prev) => {
-                  const map = new Map<string, SmsOrder>();
-                  prev.forEach((o) => map.set(o.id, o));
-                  fsItems.forEach((o) => map.set(o.id, o));
-                  return Array.from(map.values()).sort(
-                    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-                  );
-                });
-              }
-            },
-            (err) => {
-              console.warn('Orders listener error:', err);
-            }
-          );
-
-          return () => unsubOrders();
         } catch {
           setUserProfile({
-            id: firebaseUser.uid,
+            id: uid,
             email: firebaseUser.email || 'user@nxvsms.com',
             displayName: firebaseUser.displayName || 'NXV User',
             role: 'user',
@@ -178,64 +216,84 @@ export default function App() {
             updatedAt: new Date().toISOString(),
           });
         }
+
+        // Strictly listen to THIS user's private subcollection in Firestore
+        const ordersRef = collection(db, 'users', uid, 'smsOrders');
+        const q = query(ordersRef, orderBy('createdAt', 'desc'));
+        unsubOrders = onSnapshot(
+          q,
+          (snapshot) => {
+            const fsItems: SmsOrder[] = [];
+            snapshot.forEach((d) => {
+              const data = d.data() as SmsOrder;
+              if (data && data.userId === uid) {
+                fsItems.push(data);
+              }
+            });
+
+            // Set state strictly to this authenticated user's orders
+            setOrders(fsItems);
+            setStoredUserOrders(uid, fsItems);
+
+            setActiveOrder((current) => {
+              if (!current || current.userId !== uid) {
+                const waitingOrder = fsItems.find((o) => o.status === 'WAITING') || (fsItems.length > 0 ? fsItems[0] : null);
+                setStoredUserActiveOrder(uid, waitingOrder);
+                return waitingOrder;
+              }
+              const updatedMatch = fsItems.find((o) => o.id === current.id);
+              if (updatedMatch) {
+                setStoredUserActiveOrder(uid, updatedMatch);
+                return updatedMatch;
+              }
+              return current;
+            });
+          },
+          (err) => {
+            console.warn('Orders listener error:', err);
+          }
+        );
+      } else {
+        // When logged out, reset state completely so no other user sees previous data
+        setUserProfile(null);
+        setOrders([]);
+        setActiveOrder(null);
       }
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribe();
+      if (unsubOrders) unsubOrders();
+    };
   }, []);
 
-  // 3. CONTINUOUS BACKGROUND OTP SYNC & RECOVERY
-  // Polls live gateway every 3.5s so even if the page refreshes, received OTPs are immediately caught and displayed!
+  // 3. CONTINUOUS BACKGROUND OTP SYNC FOR USER'S PENDING ORDERS ONLY
+  // Polls live gateway only for phone numbers that THIS logged in user has requested!
   useEffect(() => {
+    if (!userProfile?.id) return;
+    const currentUserId = userProfile.id;
+
     const checkGatewayOtps = async () => {
+      // Find orders belonging strictly to THIS USER that are currently WAITING for OTP
+      const waitingOrders = orders.filter(
+        (ord) => ord.userId === currentUserId && ord.status === 'WAITING'
+      );
+
+      // If user has no active orders waiting for OTP, skip polling
+      if (waitingOrders.length === 0) return;
+
       try {
         const res = await API.getAllOtps();
         if (!res.success || !res.otps || res.otps.length === 0) return;
 
-        // If local orders is completely empty, auto-recover any existing OTP records from the gateway!
-        if (orders.length === 0 && res.otps.length > 0) {
-          const recoveredList: SmsOrder[] = res.otps.map((item, idx) => {
-            const rawNum = item.number;
-            const fullNum = rawNum.startsWith('+') ? rawNum : `+${rawNum}`;
-            const cInfo = detectCountryFromRange(rawNum);
-
-            let otpCode = item.otp;
-            const matchCode = String(item.otp || '').match(/\b\d{4,8}\b/);
-            if (matchCode) otpCode = matchCode[0];
-
-            return {
-              id: item.nid || `ORD-REC-${idx}-${Date.now()}`,
-              userId: userProfile?.id || 'user',
-              phoneNumber: fullNum,
-              service: item.otp.toLowerCase().includes('facebook') ? 'Facebook' : item.otp.toLowerCase().includes('instagram') ? 'Instagram' : item.otp.toLowerCase().includes('whatsapp') ? 'WhatsApp' : 'Live SMS',
-              country: `${cInfo.flag} ${cInfo.name}`,
-              range: rawNum.slice(0, 6) + 'XXX',
-              price: 0,
-              status: 'RECEIVED',
-              otpCode: otpCode,
-              fullMessage: item.otp,
-              createdAt: item.created_at || new Date().toISOString(),
-              updatedAt: item.created_at || new Date().toISOString(),
-              expiresAt: new Date(Date.now() + 600 * 1000).toISOString(),
-            };
-          });
-
-          setOrders(recoveredList);
-          setActiveOrder(recoveredList[0]);
-          try {
-            localStorage.setItem('nxv_sms_orders', JSON.stringify(recoveredList));
-            localStorage.setItem('nxv_active_order', JSON.stringify(recoveredList[0]));
-          } catch {}
-          return;
-        }
-
-        // Match against existing orders
+        // Match received OTPs ONLY against this user's existing WAITING orders
         setOrders((prevOrders) => {
           let modified = false;
 
           const updatedOrders = prevOrders.map((ord) => {
-            // If already received with code, nothing to change
-            if (ord.status === 'RECEIVED' && ord.otpCode) return ord;
+            if (ord.userId !== currentUserId || ord.status !== 'WAITING') {
+              return ord;
+            }
 
             const cleanTarget = ord.phoneNumber.replace(/[^0-9]/g, '');
 
@@ -264,31 +322,22 @@ export default function App() {
                 updatedAt: now,
               };
 
-              // Update active order if it's the matching one
-              setActiveOrder((currentActive) => {
-                if (
-                  !currentActive ||
-                  currentActive.id === ord.id ||
-                  currentActive.phoneNumber.replace(/[^0-9]/g, '') === cleanTarget
-                ) {
-                  try {
-                    localStorage.setItem('nxv_active_order', JSON.stringify(updatedOrder));
-                  } catch {}
+              setActiveOrder((curActive) => {
+                if (curActive && curActive.id === ord.id) {
+                  setStoredUserActiveOrder(currentUserId, updatedOrder);
                   return updatedOrder;
                 }
-                return currentActive;
+                return curActive;
               });
 
-              // Update in Firestore
-              if (userProfile?.id) {
-                const orderDocRef = doc(db, 'users', userProfile.id, 'smsOrders', ord.id);
-                updateDoc(orderDocRef, {
-                  status: 'RECEIVED',
-                  otpCode: code,
-                  fullMessage: match.otp,
-                  updatedAt: now,
-                }).catch(() => {});
-              }
+              // Persist to user's private Firestore subcollection
+              const orderDocRef = doc(db, 'users', currentUserId, 'smsOrders', ord.id);
+              updateDoc(orderDocRef, {
+                status: 'RECEIVED',
+                otpCode: code,
+                fullMessage: match.otp,
+                updatedAt: now,
+              }).catch(() => {});
 
               addLog({
                 type: 'success',
@@ -303,26 +352,20 @@ export default function App() {
           });
 
           if (modified) {
-            try {
-              localStorage.setItem('nxv_sms_orders', JSON.stringify(updatedOrders));
-            } catch {}
+            setStoredUserOrders(currentUserId, updatedOrders);
             return updatedOrders;
           }
 
           return prevOrders;
         });
-      } catch (err) {
+      } catch {
         // silent background check
       }
     };
 
-    // Run immediately on mount
-    checkGatewayOtps();
-
-    // Check every 3.5 seconds
-    const interval = setInterval(checkGatewayOtps, 3500);
+    const interval = setInterval(checkGatewayOtps, 3000);
     return () => clearInterval(interval);
-  }, [userProfile?.id, orders.length]);
+  }, [userProfile?.id, orders]);
 
   // Load active ranges directly from API
   const loadActiveRanges = async () => {
@@ -354,38 +397,39 @@ export default function App() {
   };
 
   const handleAddOrderToHistory = (order: SmsOrder) => {
-    setActiveOrder(order);
+    if (!userProfile?.id) return;
+    const uid = userProfile.id;
+    const userOrder: SmsOrder = { ...order, userId: uid };
+
+    setActiveOrder(userOrder);
     setOrders((prev) => {
-      const updated = [order, ...prev.filter((o) => o.id !== order.id)];
-      try {
-        localStorage.setItem('nxv_sms_orders', JSON.stringify(updated));
-        localStorage.setItem('nxv_active_order', JSON.stringify(order));
-      } catch {}
+      const updated = [userOrder, ...prev.filter((o) => o.id !== userOrder.id && o.userId === uid)];
+      setStoredUserOrders(uid, updated);
+      setStoredUserActiveOrder(uid, userOrder);
       return updated;
     });
 
     addLog({
       type: 'success',
       endpoint: 'POST /v1/getnum',
-      message: `Allocated: ${order.phoneNumber} for ${order.service}`,
+      message: `Allocated: ${userOrder.phoneNumber} for ${userOrder.service}`,
     });
   };
 
   const handleUpdateOrderInHistory = (orderId: string, updates: Partial<SmsOrder>) => {
+    if (!userProfile?.id) return;
+    const uid = userProfile.id;
+
     setOrders((prev) => {
-      const updated = prev.map((o) => (o.id === orderId ? { ...o, ...updates } : o));
-      try {
-        localStorage.setItem('nxv_sms_orders', JSON.stringify(updated));
-      } catch {}
+      const updated = prev.map((o) => (o.id === orderId && o.userId === uid ? { ...o, ...updates } : o));
+      setStoredUserOrders(uid, updated);
       return updated;
     });
 
     setActiveOrder((cur) => {
-      if (cur && cur.id === orderId) {
+      if (cur && cur.id === orderId && cur.userId === uid) {
         const next = { ...cur, ...updates };
-        try {
-          localStorage.setItem('nxv_active_order', JSON.stringify(next));
-        } catch {}
+        setStoredUserActiveOrder(uid, next);
         return next;
       }
       return cur;
@@ -411,13 +455,16 @@ export default function App() {
   const handleLogout = async () => {
     try {
       await signOut(auth);
-      setUserProfile(null);
+    } catch {}
+    setUserProfile(null);
+    setOrders([]);
+    setActiveOrder(null);
+    try {
       localStorage.removeItem('nxv_user_profile');
-      addLog({ type: 'info', message: 'User signed out' });
-    } catch {
-      setUserProfile(null);
-      localStorage.removeItem('nxv_user_profile');
-    }
+      localStorage.removeItem('nxv_sms_orders');
+      localStorage.removeItem('nxv_active_order');
+    } catch {}
+    addLog({ type: 'info', message: 'User signed out' });
   };
 
   // If not signed in, show Auth Page
