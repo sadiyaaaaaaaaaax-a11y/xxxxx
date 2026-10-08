@@ -27,7 +27,10 @@ import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 
-export const db: Firestore = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const rawConfig = firebaseConfig as Record<string, string | undefined>;
+export const db: Firestore = rawConfig.firestoreDatabaseId
+  ? getFirestore(app, rawConfig.firestoreDatabaseId)
+  : getFirestore(app);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 
