@@ -180,13 +180,20 @@ export const API = {
       const isSuccess = res.ok && json.success === true;
       const list: any[] = json.data || [];
 
-      const formatted: BroadcastItem[] = list.map((b: any, idx: number) => ({
-        id: b.id || `bc-${idx}`,
-        title: `${b.service || 'OTP'} on ${b.country || 'Global'} (${b.operator || 'Route'})`,
-        message: b.otp ? `Received SMS: "${b.otp}" on ${b.number}` : (b.message || 'Live network SMS delivery'),
-        type: 'UPDATE',
-        time: b.time ? new Date(Number(b.time)).toLocaleTimeString() : 'Live',
-      }));
+      const formatted: BroadcastItem[] = list.map((b: any, idx: number) => {
+        const rawNum = String(b.number || '');
+        const maskedNum = rawNum.length > 5
+          ? `${rawNum.slice(0, 4)}••••${rawNum.slice(-2)}`
+          : '••••••';
+
+        return {
+          id: b.id || `bc-${idx}`,
+          title: `${b.service || 'SMS'} Route (${b.country || 'Global'})`,
+          message: `Live Gateway Delivery on ${maskedNum} • [OTP Code Received & Protected]`,
+          type: 'UPDATE',
+          time: b.time ? new Date(Number(b.time)).toLocaleTimeString() : 'Live',
+        };
+      });
 
       return {
         success: isSuccess,
